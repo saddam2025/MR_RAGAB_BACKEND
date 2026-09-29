@@ -1,0 +1,262 @@
+const mongoose = require('mongoose');
+const Assignment = require('../models/Assignment');
+const Course = require('../models/Course');
+const Lecture = require('../models/Lecture');
+const LectureProgress = require('../models/LectureProgress');
+const User = require('../models/User');
+const { getLectureAccessState } = require('./lectureAccessController');
+const createNotificationsForAudience = require('../utils/createNotification');
+const { uploadAssignmentFile } = require('../utils/r2Upload');
+
+function getTenantFilter(req) {
+  return req.tenantFilter || (req.user.tenantId ? { tenantId: req.user.tenantId } : {});
+}
+
+function isOwnerOfInstructor(user, instructorId) {
+  if (!user) return false;
+  if (user.role === 'admin') return String(user._id) === String(instructorId);
+  if (user.role === 'assistant') return String(user.instructorId) === String(instructorId);
+  return false;
+}
+
+async function getCourse(req, courseId) {
+  if (!mongoose.isValidObjectId(courseId)) return null;
+  return Course.findOne({ _id: courseId, isPublished: true, ...getTenantFilter(req) });
+}
+
+// POST /api/v1/courses/:courseId/assignments/submit
+// Creates or replaces the authenticated student's one submission for a
+// course. studentId and tenantId are always derived from the authenticated
+// request, never from multipart form fields.
+exports.submitAssignment = async (req, res, next) => {
+  try {
+    const { courseId, lectureId } = req.params;
+    const submissionNote = typeof req.body?.submissionNote === 'string' ? req.body.submissionNote.trim() : '';
+
+    if (submissionNote.length > 5000) {
+      return res.status(400).json({ message: 'ملاحظة التسليم طويلة جداً' });
+    }
+    if (!req.file && !submissionNote) {
+      return res.status(400).json({ message: 'أرفق ملفاً أو أضف ملاحظة للتسليم' });
+    }
+
+    const course = await getCourse(req, courseId);
+    if (!course) return res.status(404).json({ message: 'الدورة غير موجودة' });
+    const lecture = lectureId ? await Lecture.findOne({ _id: lectureId, courseId: course._id, ...getTenantFilter(req) }) : null;
+    if (lectureId && !lecture) return res.status(404).json({ message: 'المحاضرة غير موجودة' });
+    if (!lecture) return res.status(400).json({ message: 'يجب تسليم الواجب من خلال محاضرة محددة' });
+    const accessState = await getLectureAccessState({ studentId: req.user._id, tenantFilter: getTenantFilter(req), courseId: course._id, lectureId: lecture._id });
+    if (!accessState.accessible) return res.status(403).json({ message: 'لا تملك صلاحية هذه المحاضرة' });
+
+    const filter = { courseId: course._id, lectureId: lecture?._id || null, studentId: req.user._id, ...getTenantFilter(req) };
+    const existingAssignment = await Assignment.findOne(filter).select('status');
+    if (existingAssignment && existingAssignment.status !== 'resubmit') {
+      return res.status(409).json({ message: 'تم تسليم الواجب بالفعل وهو بانتظار التقييم' });
+    }
+    const update = {
+      $set: {
+        submissionNote,
+        status: 'pending',
+        grade: null,
+        feedback: '',
+        submittedAt: new Date()
+      },
+      $setOnInsert: { tenantId: course.tenantId, studentId: req.user._id, courseId: course._id, lectureId: lecture?._id || null }
+    };
+    // uploadAssignment uses Multer memory storage, so this is a direct
+    // buffer-to-R2 transfer with no temporary local assignment file.
+    if (req.file) update.$set.submissionFileUrl = await uploadAssignmentFile(req.file);
+
+    const assignment = await Assignment.findOneAndUpdate(filter, update, {
+      new: true,
+      upsert: true,
+      runValidators: true,
+      setDefaultsOnInsert: true
+    });
+
+    // This is the progress signal used by CourseController's next-lecture
+    // lock calculation; it is scoped to the same student/course/tenant.
+    await LectureProgress.findOneAndUpdate(
+      { studentId: req.user._id, lectureId: lecture._id, ...getTenantFilter(req) },
+      { $set: { homeworkCompleted: true }, $setOnInsert: { tenantId: course.tenantId, studentId: req.user._id, courseId: course._id, lectureId: lecture._id } },
+      { upsert: true, new: true, setDefaultsOnInsert: true }
+    );
+
+    const graders = await User.find({
+      tenantId: course.tenantId,
+      instructorId: course.instructorId,
+      role: 'assistant',
+      isActive: true,
+      deletedAt: null,
+      permissions: 'can_grade_exams'
+    }).select('_id').lean();
+    if (graders.length) {
+      await createNotificationsForAudience({
+        tenantId: course.tenantId,
+        instructorId: course.instructorId,
+        type: 'assignment_submitted',
+        title: 'واجب جديد بانتظار التصحيح',
+        body: `سلّم ${req.user.name || 'طالب'} واجبًا جديدًا في ${course.title_ar || 'أحد الكورسات'}.`,
+        relatedId: assignment._id,
+        recipientIds: graders.map((grader) => grader._id)
+      });
+    }
+
+    res.status(201).json({ data: assignment });
+  } catch (err) {
+    // The compound index is a final guard against simultaneous submits.
+    if (err.code === 11000) {
+      return res.status(409).json({ message: 'تم إرسال التسليم بالتزامن؛ أعد المحاولة' });
+    }
+    next(err);
+  }
+};
+
+// GET /api/v1/courses/:courseId/assignments/mine
+exports.getMyAssignment = async (req, res, next) => {
+  try {
+    const course = await getCourse(req, req.params.courseId);
+    if (!course) return res.status(404).json({ message: 'الدورة غير موجودة' });
+
+    const lecture = req.params.lectureId ? await Lecture.findOne({ _id: req.params.lectureId, courseId: course._id, ...getTenantFilter(req) }) : null;
+    if (req.params.lectureId && !lecture) return res.status(404).json({ message: 'المحاضرة غير موجودة' });
+    const assignment = await Assignment.findOne({
+      courseId: course._id,
+      lectureId: lecture?._id || null,
+      studentId: req.user._id,
+      ...getTenantFilter(req)
+    });
+    res.set('Cache-Control', 'no-store, no-cache, must-revalidate');
+    res.json({ data: assignment || null });
+  } catch (err) {
+    next(err);
+  }
+};
+
+async function listInstructorAssignments(req, res, next, pendingOnly) {
+  try {
+    const { instructorId } = req.params;
+    if (!mongoose.isValidObjectId(instructorId)) return res.status(400).json({ message: 'معرف المدرس غير صالح' });
+    if (!isOwnerOfInstructor(req.user, instructorId)) {
+      return res.status(403).json({ message: 'غير مصرح لك بعرض قائمة واجبات هذا الحساب' });
+    }
+
+    const filter = { ...getTenantFilter(req) };
+    if (pendingOnly) filter.status = 'pending';
+    const assignments = await Assignment.find(filter)
+      .populate({ path: 'courseId', match: { instructorId, ...getTenantFilter(req) }, select: 'title_ar title_en instructorId' })
+      .populate({ path: 'studentId', select: 'name email' })
+      .sort({ submittedAt: 1 });
+
+    // A tenant can theoretically contain several instructors, so population
+    // matching is not enough: remove assignments whose course is another
+    // instructor's before returning the queue.
+    const data = assignments.filter((assignment) => assignment.courseId);
+    res.json({ data });
+  } catch (err) {
+    next(err);
+  }
+}
+
+// GET /api/v1/instructors/:instructorId/assignments/pending
+exports.getPendingAssignments = (req, res, next) => listInstructorAssignments(req, res, next, true);
+
+// GET /api/v1/instructors/:instructorId/assignments
+// The dashboard needs all real submission statuses, while the grading queue
+// remains intentionally limited to pending work.
+exports.getInstructorAssignments = (req, res, next) => listInstructorAssignments(req, res, next, false);
+
+// GET /api/v1/assignments/:id
+exports.getAssignment = async (req, res, next) => {
+  try {
+    if (!mongoose.isValidObjectId(req.params.id)) return res.status(400).json({ message: 'معرف الواجب غير صالح' });
+    const assignment = await Assignment.findOne({ _id: req.params.id, ...getTenantFilter(req) })
+      .populate('courseId', 'title_ar title_en instructorId')
+      .populate('studentId', 'name email');
+    if (!assignment || !assignment.courseId) return res.status(404).json({ message: 'الواجب غير موجود' });
+
+    const isStudentOwner = req.user.role === 'student' && String(assignment.studentId._id) === String(req.user._id);
+    if (!isStudentOwner && !isOwnerOfInstructor(req.user, assignment.courseId.instructorId)) {
+      return res.status(403).json({ message: 'غير مصرح لك بعرض هذا الواجب' });
+    }
+    res.json({ data: assignment });
+  } catch (err) {
+    next(err);
+  }
+};
+
+// PATCH /api/v1/assignments/:id/grade
+exports.gradeAssignment = async (req, res, next) => {
+  try {
+    if (!mongoose.isValidObjectId(req.params.id)) return res.status(400).json({ message: 'معرف الواجب غير صالح' });
+    const { status, feedback } = req.body || {};
+    if (!['graded', 'resubmit'].includes(status)) {
+      return res.status(400).json({ message: 'حالة التقييم غير صالحة' });
+    }
+    if (typeof feedback !== 'string' || feedback.trim().length > 5000) {
+      return res.status(400).json({ message: 'ملاحظات التقييم غير صالحة' });
+    }
+    const grade = req.body.grade;
+    if (status === 'graded' && (!Number.isFinite(grade) || grade < 0 || grade > 100)) {
+      return res.status(400).json({ message: 'الدرجة يجب أن تكون رقماً بين 0 و100' });
+    }
+
+    const assignment = await Assignment.findOne({ _id: req.params.id, ...getTenantFilter(req) }).populate('courseId', 'title_ar instructorId');
+    if (!assignment || !assignment.courseId) return res.status(404).json({ message: 'الواجب غير موجود' });
+    if (!isOwnerOfInstructor(req.user, assignment.courseId.instructorId)) {
+      return res.status(403).json({ message: 'غير مصرح لك بتصحيح هذا الواجب' });
+    }
+
+    assignment.status = status;
+    assignment.grade = status === 'graded' ? grade : null;
+    assignment.feedback = feedback.trim();
+    assignment.gradedAt = new Date();
+    await assignment.save();
+
+    await createNotificationsForAudience({
+      tenantId: assignment.tenantId,
+      instructorId: assignment.courseId.instructorId,
+      type: 'assignment_graded',
+      title: status === 'graded' ? 'تم تصحيح الواجب' : 'مطلوب إعادة تسليم الواجب',
+      body: status === 'graded'
+        ? `تم تصحيح واجب ${assignment.courseId.title_ar}. درجتك: ${assignment.grade}`
+        : `يرجى إعادة تسليم واجب ${assignment.courseId.title_ar} بعد مراجعة الملاحظات.`,
+      relatedId: assignment._id,
+      recipientIds: assignment.studentId
+    });
+
+    const parents = await User.find({ role: 'parent', childId: assignment.studentId, ...getTenantFilter(req) }).select('_id').lean();
+    if (parents.length) {
+      await createNotificationsForAudience({
+        tenantId: assignment.tenantId,
+        instructorId: assignment.courseId.instructorId,
+        type: 'assignment_graded',
+        title: status === 'graded' ? 'ظهرت درجة الواجب' : 'الواجب يحتاج إعادة تسليم',
+        body: status === 'graded'
+          ? `تم تصحيح واجب ${assignment.courseId.title_ar}. درجة الطالب: ${assignment.grade}`
+          : `واجب الطالب في ${assignment.courseId.title_ar} يحتاج إلى إعادة تسليم بعد مراجعة الملاحظات.`,
+        relatedId: assignment._id,
+        recipientIds: parents.map((parent) => parent._id)
+      });
+    }
+
+    res.json({ data: assignment });
+  } catch (err) {
+    next(err);
+  }
+};
+
+
+async function getAssignmentGradesForStudent({ studentId, tenantFilter }) {
+  const assignments = await Assignment.find({ studentId, ...tenantFilter }).sort({ submittedAt: -1, updatedAt: -1 }).populate('courseId', 'title_ar title_en').populate('lectureId', 'title_ar title_en').lean();
+  return assignments.map((assignment) => ({ _id: assignment._id, grade: assignment.grade, feedback: assignment.feedback, status: assignment.status, lectureTitle: assignment.lectureId?.title_ar || assignment.lectureId?.title_en || null, courseTitle: assignment.courseId?.title_ar || assignment.courseId?.title_en || null, submittedAt: assignment.submittedAt, gradedAt: assignment.gradedAt || null }));
+}
+
+exports.getAssignmentGradesForStudent = getAssignmentGradesForStudent;
+
+exports.listMyAssignmentGrades = async (req, res, next) => {
+  try {
+    const data = await getAssignmentGradesForStudent({ studentId: req.user._id, tenantFilter: getTenantFilter(req) });
+    res.json({ data });
+  } catch (err) { next(err); }
+};

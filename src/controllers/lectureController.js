@@ -1,0 +1,261 @@
+const mongoose = require('mongoose');
+const Course = require('../models/Course');
+const Lecture = require('../models/Lecture');
+const LectureProgress = require('../models/LectureProgress');
+const LectureAccess = require('../models/LectureAccess');
+const CourseEnrollment = require('../models/CourseEnrollment');
+const Quiz = require('../models/Quiz');
+const Tenant = require('../models/Tenant');
+const User = require('../models/User');
+const BunnyUpload = require('../models/BunnyUpload');
+const { getLectureAccessState } = require('./lectureAccessController');
+const { createVideoSlot, directTusUpload, getVerifiedUploadedVideo, playbackUrls, DIRECT_UPLOAD_TTL_SECONDS } = require('../utils/bunnyStream');
+const { uploadHomeworkFile, uploadImageFile } = require('../utils/r2Upload');
+const createNotificationsForAudience = require('../utils/createNotification');
+
+function ownsInstructor(user, instructorId) {
+  return (user.role === 'admin' && String(user._id) === String(instructorId))
+    || (user.role === 'assistant' && String(user.instructorId) === String(instructorId));
+}
+
+async function notifyCourseEnrolleesOfLecture(course, lecture) {
+  if (!course.isPublished || !lecture.isPublished) return;
+  const now = new Date();
+  const publishedLectureIds = await Lecture.find({ courseId: course._id, tenantId: course.tenantId, isPublished: true }).distinct('_id');
+  const [enrolledStudentIds, accessStudentIds] = await Promise.all([
+    CourseEnrollment.find({ courseId: course._id, tenantId: course.tenantId, expiresAt: { $gt: now } }).distinct('studentId'),
+    LectureAccess.find({
+      courseId: { $in: [course._id, ...publishedLectureIds] },
+      tenantId: course.tenantId,
+      expiresAt: { $gt: now }
+    }).distinct('studentId')
+  ]);
+  const studentIds = [...new Set([...enrolledStudentIds, ...accessStudentIds].map(String))];
+  if (!studentIds.length) return;
+  await createNotificationsForAudience({
+    tenantId: course.tenantId,
+    instructorId: course.instructorId,
+    type: 'new_lecture',
+    title: 'محاضرة جديدة في كورس مشترك به',
+    body: `تم نشر محاضرة جديدة: ${lecture.title_ar || lecture.title_en || 'محاضرة جديدة'} — ${course.title_ar || course.title_en || 'الكورس'}`,
+    relatedId: course._id,
+    recipientIds: studentIds
+  });
+}
+
+async function resolveInstructorTenant(instructorId) {
+  const instructor = mongoose.isValidObjectId(instructorId)
+    ? await User.findOne({ _id: instructorId, role: 'admin' }).select('_id tenantId').lean()
+    : null;
+  if (instructor) return { tenantId: instructor.tenantId, instructorId: instructor._id };
+
+  const tenant = await Tenant.findOne({ subdomain: instructorId, isActive: true, deletedAt: null }).select('_id ownerId').lean();
+  return tenant?.ownerId ? { tenantId: tenant._id, instructorId: tenant.ownerId } : null;
+}
+
+exports.createLecture = async (req, res, next) => {
+  try {
+    const { instructorId, courseId } = req.params;
+    if (!ownsInstructor(req.user, instructorId)) return res.status(403).json({ message: 'غير مصرح لك بإدارة محاضرات هذا الكورس' });
+    const course = await Course.findOne({ _id: courseId, instructorId, ...req.tenantFilter });
+    if (!course) return res.status(404).json({ message: 'الكورس غير موجود' });
+    if (typeof req.body.title_ar !== 'string' || !req.body.title_ar.trim()) return res.status(400).json({ message: 'عنوان المحاضرة بالعربية مطلوب' });
+    const baseFields = {
+      tenantId: req.user.tenantId, courseId, instructorId,
+      title_ar: req.body.title_ar, title_en: req.body.title_en || '',
+      description_ar: req.body.description_ar || '', description_en: req.body.description_en || '',
+      price: Number(req.body.price) || 0,
+      thumbnailUrl: req.files?.thumbnail?.[0] ? await uploadImageFile(req.files.thumbnail[0], 'thumbnails', 'Lecture thumbnail') : null,
+      videoUrl: null,
+      homeworkUrl: req.files?.homework?.[0] ? await uploadHomeworkFile(req.files.homework[0]) : null,
+      accessPeriodDays: Number(req.body.accessPeriodDays) || 10,
+      maxViews: Number(req.body.maxViews) || 10,
+      isPublished: req.body.isPublished === true || req.body.isPublished === 'true'
+    };
+    // The server, rather than a value submitted by the form, owns the order.
+    // Retrying with a fresh maximum makes the first lecture and concurrent
+    // additions safe even when the client has stale list data.
+    let lecture;
+    for (let attempt = 0; attempt < 5; attempt += 1) {
+      const lastLecture = await Lecture.findOne({ tenantId: req.user.tenantId, courseId, instructorId }).sort({ order: -1 }).select('order').lean();
+      try {
+        lecture = await Lecture.create({ ...baseFields, order: Number(lastLecture?.order || 0) + 1 });
+        break;
+      } catch (err) {
+        if (err.code !== 11000 || attempt === 4) throw err;
+      }
+    }
+    if (baseFields.isPublished) await notifyCourseEnrolleesOfLecture(course, lecture);
+    res.status(201).json({ data: lecture });
+  } catch (err) {
+    if (err.code === 11000 && (err.keyPattern?.order || String(err.message || '').includes('courseId_1_order_1'))) {
+      return res.status(409).json({ message: 'تعذر تحديد ترتيب جديد للمحاضرة؛ أعد المحاولة.' });
+    }
+    next(err);
+  }
+};
+
+async function lectureFields(req) {
+  const fields = {};
+  for (const key of ['title_ar', 'title_en', 'description_ar', 'description_en']) if (req.body[key] !== undefined) fields[key] = req.body[key];
+  for (const key of ['order', 'price', 'accessPeriodDays', 'maxViews']) if (req.body[key] !== undefined) fields[key] = Number(req.body[key]);
+  if (req.body.quizId !== undefined) fields.quizId = req.body.quizId || null;
+  if (req.body.isPublished !== undefined) fields.isPublished = req.body.isPublished === true || req.body.isPublished === 'true';
+  if (req.files?.thumbnail?.[0]) fields.thumbnailUrl = await uploadImageFile(req.files.thumbnail[0], 'thumbnails', 'Lecture thumbnail');
+  if (req.files?.homework?.[0]) fields.homeworkUrl = await uploadHomeworkFile(req.files.homework[0]);
+  return fields;
+}
+
+async function getOwnedLecture(req) {
+  const { instructorId, courseId, lectureId } = req.params;
+  if (!ownsInstructor(req.user, instructorId)) return false;
+  return Lecture.findOne({ _id: lectureId, courseId, instructorId, ...req.tenantFilter });
+}
+
+exports.listLecturesForEditing = async (req, res, next) => {
+  try {
+    const { instructorId, courseId } = req.params;
+    if (!ownsInstructor(req.user, instructorId)) return res.status(403).json({ message: 'غير مصرح لك بإدارة محاضرات هذا الكورس' });
+    const course = await Course.findOne({ _id: courseId, instructorId, ...req.tenantFilter });
+    if (!course) return res.status(404).json({ message: 'الكورس غير موجود' });
+    res.json({ data: await Lecture.find({ courseId, instructorId, ...req.tenantFilter }).sort({ order: 1 }).lean() });
+  } catch (err) { next(err); }
+};
+
+exports.updateLecture = async (req, res, next) => {
+  try {
+    const lecture = await getOwnedLecture(req);
+    if (lecture === false) return res.status(403).json({ message: 'غير مصرح لك بإدارة محاضرات هذا الكورس' });
+    if (!lecture) return res.status(404).json({ message: 'المحاضرة غير موجودة' });
+    const wasPublished = lecture.isPublished;
+    Object.assign(lecture, await lectureFields(req)); await lecture.save();
+    if (lecture.quizId) await Quiz.updateOne({ _id: lecture.quizId, ...req.tenantFilter }, { $set: { courseId: lecture.courseId, lectureId: lecture._id, type: 'lecture', instructorId: lecture.instructorId } });
+    if (!wasPublished && lecture.isPublished) {
+      const course = await Course.findOne({ _id: lecture.courseId, tenantId: lecture.tenantId, instructorId: lecture.instructorId }).select('title_ar title_en isPublished tenantId instructorId').lean();
+      if (course) await notifyCourseEnrolleesOfLecture(course, lecture);
+    }
+    res.json({ data: lecture });
+  } catch (err) { next(err); }
+};
+
+// POST /api/v1/instructors/:instructorId/courses/:courseId/lectures/:lectureId/video-upload-init
+exports.initLectureVideoUpload = async (req, res, next) => {
+  try {
+    const lecture = await getOwnedLecture(req);
+    if (lecture === false) return res.status(403).json({ message: 'غير مصرح لك برفع فيديو لهذه المحاضرة' });
+    if (!lecture) return res.status(404).json({ message: 'المحاضرة غير موجودة' });
+    const { settings, videoId } = await createVideoSlot(req.body?.title || lecture.title_ar || lecture.title_en || 'Lecture');
+    const pending = await BunnyUpload.create({ tenantId: req.user.tenantId, instructorId: req.params.instructorId, uploadedBy: req.user._id, target: 'lecture', bunnyVideoId: videoId, courseId: lecture.courseId, lectureId: lecture._id, expiresAt: new Date(Date.now() + DIRECT_UPLOAD_TTL_SECONDS * 1000) });
+    return res.status(201).json({ data: { uploadId: pending._id, videoId, upload: directTusUpload(videoId, settings) } });
+  } catch (err) { next(err); }
+};
+
+// POST /api/v1/instructors/:instructorId/courses/:courseId/lectures/:lectureId/confirm-video-upload
+exports.confirmLectureVideoUpload = async (req, res, next) => {
+  try {
+    const lecture = await getOwnedLecture(req);
+    const { uploadId } = req.body || {};
+    if (lecture === false) return res.status(403).json({ message: 'غير مصرح لك بتأكيد رفع فيديو لهذه المحاضرة' });
+    if (!lecture) return res.status(404).json({ message: 'المحاضرة غير موجودة' });
+    if (!mongoose.isValidObjectId(uploadId)) return res.status(400).json({ message: 'طلب الرفع غير صالح' });
+    const pending = await BunnyUpload.findOne({ _id: uploadId, target: 'lecture', tenantId: req.user.tenantId, instructorId: req.params.instructorId, uploadedBy: req.user._id, courseId: lecture.courseId, lectureId: lecture._id });
+    if (!pending || pending.expiresAt <= new Date()) return res.status(404).json({ message: 'طلب رفع الفيديو غير موجود أو منتهي' });
+
+    // Bunny is queried with the private server API key before the database is
+    // changed. A client-side "complete" assertion alone can never set videoUrl.
+    const { video, settings } = await getVerifiedUploadedVideo(pending.bunnyVideoId);
+    const claimed = await BunnyUpload.findOneAndUpdate(
+      { _id: pending._id, expiresAt: { $gt: new Date() }, confirmedAt: null },
+      { $set: { confirmedAt: new Date() } },
+      { new: true }
+    );
+    if (!claimed) {
+      const existing = await Lecture.findOne({ bunnyVideoId: pending.bunnyVideoId, ...req.tenantFilter });
+      if (existing) return res.json({ data: existing });
+      return res.status(409).json({ message: 'يجري تأكيد هذا الرفع بالفعل؛ أعد المحاولة بعد لحظات' });
+    }
+    try {
+      Object.assign(lecture, { bunnyVideoId: video.guid, ...playbackUrls(video.guid, settings) });
+      await lecture.save();
+      await BunnyUpload.deleteOne({ _id: claimed._id });
+      return res.json({ data: lecture });
+    } catch (err) {
+      const existing = await Lecture.findOne({ bunnyVideoId: pending.bunnyVideoId, ...req.tenantFilter });
+      if (existing) return res.json({ data: existing });
+      await BunnyUpload.updateOne({ _id: claimed._id }, { $set: { confirmedAt: null } });
+      throw err;
+    }
+  } catch (err) { next(err); }
+};
+
+exports.reorderLectures = async (req, res, next) => {
+  try {
+    const { instructorId, courseId } = req.params;
+    if (!ownsInstructor(req.user, instructorId)) return res.status(403).json({ message: 'غير مصرح لك بإدارة محاضرات هذا الكورس' });
+    const ids = Array.isArray(req.body?.lectureIds) ? req.body.lectureIds : [];
+    const lectures = await Lecture.find({ courseId, instructorId, ...req.tenantFilter }).select('_id order');
+    if (ids.length !== lectures.length || new Set(ids.map(String)).size !== ids.length || !lectures.every((item) => ids.some((id) => String(id) === String(item._id)))) return res.status(400).json({ message: 'ترتيب المحاضرات غير صالح' });
+    // Move every document out of the unique order range first. Updating a
+    // swap in parallel (1 → 2 while 2 → 1) otherwise triggers the unique
+    // index even though the final order is valid.
+    const temporaryStart = Math.max(...lectures.map((lecture) => Number(lecture.order) || 0), ids.length) + ids.length + 1;
+    await Lecture.bulkWrite(ids.map((id, index) => ({ updateOne: { filter: { _id: id, courseId, instructorId, ...req.tenantFilter }, update: { $set: { order: temporaryStart + index } } } })));
+    await Lecture.bulkWrite(ids.map((id, index) => ({ updateOne: { filter: { _id: id, courseId, instructorId, ...req.tenantFilter }, update: { $set: { order: index + 1 } } } })));
+    res.json({ data: await Lecture.find({ courseId, instructorId, ...req.tenantFilter }).sort({ order: 1 }) });
+  } catch (err) { next(err); }
+};
+
+exports.deleteLecture = async (req, res, next) => {
+  try {
+    const lecture = await getOwnedLecture(req);
+    if (lecture === false) return res.status(403).json({ message: 'غير مصرح لك بإدارة محاضرات هذا الكورس' });
+    if (!lecture) return res.status(404).json({ message: 'المحاضرة غير موجودة' });
+    await Lecture.deleteOne({ _id: lecture._id, ...req.tenantFilter });
+    const remaining = await Lecture.find({ courseId: lecture.courseId, instructorId: lecture.instructorId, ...req.tenantFilter }).sort({ order: 1 });
+    await Promise.all(remaining.map((item, index) => Lecture.updateOne({ _id: item._id, ...req.tenantFilter }, { $set: { order: index + 1 } })));
+    res.json({ data: { id: lecture._id } });
+  } catch (err) { next(err); }
+};
+
+// GET /api/v1/instructors/:instructorId/lectures/featured
+// Public tenant-homepage feed: only published lectures whose parent courses
+// are also published may be returned. The tenant is resolved from the URL,
+// never from a potentially unrelated signed-in user's tenant.
+exports.listFeaturedLectures = async (req, res, next) => {
+  try {
+    const instructor = await resolveInstructorTenant(req.params.instructorId);
+    if (!instructor?.tenantId) return res.status(404).json({ message: 'المدرس غير موجود' });
+
+    const courses = await Course.find({ instructorId: instructor.instructorId, tenantId: instructor.tenantId, isPublished: true }).select('_id title_ar title_en').lean();
+    if (!courses.length) return res.json({ data: [] });
+    const courseTitleById = new Map(courses.map((course) => [String(course._id), course.title_ar || course.title_en]));
+    const lectures = await Lecture.find({ instructorId: instructor.instructorId, tenantId: instructor.tenantId, courseId: { $in: courses.map((course) => course._id) }, isPublished: true })
+      .sort({ updatedAt: -1, _id: -1 })
+      .limit(6)
+      .lean();
+    return res.json({ data: lectures.map((lecture) => ({ ...lecture, courseTitle: courseTitleById.get(String(lecture.courseId)) || '' })) });
+  } catch (err) { next(err); }
+};
+
+exports.listCourseLectures = async (req, res, next) => {
+  try {
+    const { courseId } = req.params;
+    if (!mongoose.isValidObjectId(courseId)) return res.status(400).json({ message: 'معرف الكورس غير صالح' });
+    // This is the public course-detail feed. Resolve the tenant from the
+    // published course so visitors do not need a session, while a signed-in
+    // tenant user cannot query a course belonging to another tenant.
+    const courseFilter = { _id: courseId, isPublished: true };
+    if (req.user?.role !== 'super_admin' && req.user?.tenantId) courseFilter.tenantId = req.user.tenantId;
+    const course = await Course.findOne(courseFilter).select('_id tenantId').lean();
+    if (!course) return res.status(404).json({ message: 'الكورس غير موجود' });
+
+    // Published-only is deliberately retained for every caller. Editing
+    // drafts remains on the ownership-protected instructor endpoint.
+    const tenantFilter = { tenantId: course.tenantId };
+    const lectures = await Lecture.find({ courseId, isPublished: true, ...tenantFilter }).sort({ order: 1 }).lean();
+    if (req.user?.role !== 'student') return res.json({ data: lectures });
+    const states = await Promise.all(lectures.map((lecture) => getLectureAccessState({ studentId: req.user._id, tenantFilter, courseId, lectureId: lecture._id })));
+    const data = states.map((state) => ({ ...state.lecture, locked: !state.accessible, status: state.status, canPurchase: state.status === 'not_purchased', includedWithCourse: state.includedWithCourse }));
+    res.json({ data });
+  } catch (err) { next(err); }
+};
