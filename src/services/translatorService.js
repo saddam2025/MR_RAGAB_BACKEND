@@ -98,11 +98,11 @@ async function translate(text, direction) {
     const translatedChunks = [];
     for (const chunk of chunks) {
       const sourceWords = chunk.trim().split(/\s+/u).length;
-      const result = await translator(chunk, {
+      const prefix = direction === 'en-ar' ? '>>ara<< ' : '';
+      const result = await translator(prefix + chunk, {
         max_new_tokens: Math.min(96, Math.max(12, sourceWords * 8)),
         num_beams: 4,
         no_repeat_ngram_size: 3,
-        repetition_penalty: 1.2,
       });
       const translated = String(result?.[0]?.translation_text || '').trim();
       // Never return decoder noise (symbols or looping phrases) as a
