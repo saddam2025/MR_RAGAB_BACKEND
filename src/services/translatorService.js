@@ -81,8 +81,17 @@ async function translate(text, direction) {
     const chunks = splitIntoSentences(text);
     const translatedChunks = [];
     for (const chunk of chunks) {
-      const result = await translator(chunk, { max_new_tokens: 160 });
-      translatedChunks.push(result?.[0]?.translation_text || '');
+      const result = await translator(chunk, { max_new_tokens: 160, num_beams: 4 });
+      const translated = String(result?.[0]?.translation_text || '').trim();
+      // Never return decoder noise (for example, repeated ampersands) as a
+      // successful translation. It is safer to surface an error than display
+      // symbols as Arabic to students.
+      if (translated && !/[\p{L}\p{N}]/u.test(translated)) {
+        const error = new Error('محرك الترجمة أعاد نتيجة غير صالحة. حاول مرة أخرى بعد قليل.');
+        error.status = 502;
+        throw error;
+      }
+      translatedChunks.push(translated);
     }
     return translatedChunks.join(' ').trim();
   });

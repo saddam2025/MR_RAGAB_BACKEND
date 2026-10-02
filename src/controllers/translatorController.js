@@ -19,6 +19,7 @@ const translateText = async (req, res, next) => {
     return res.json({ translation });
   } catch (error) {
     if (error.status === 503) return res.status(503).json({ message: error.message });
+    if (error.status === 502) return res.status(502).json({ message: error.message });
     return next(error);
   }
 };
