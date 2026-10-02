@@ -69,6 +69,7 @@ app.use('/api/v1/auth/mfa/verify-login', mfaVerifyLimiter);
 app.use('/api/v1/instructors', require('./routes/courseRoutes'));
 app.use('/api/v1', require('./routes/lectureRoutes'));
 app.use('/api/v1/public', require('./routes/publicContentRoutes'));
+app.use('/api/v1/translator', require('./routes/translatorRoutes'));
 const { quizRoutes, quizAuthoringRoutes } = require('./routes/quizRoutes');
 app.use('/api/v1/quizzes', quizRoutes);
 app.use('/api/v1/instructors', quizAuthoringRoutes);
