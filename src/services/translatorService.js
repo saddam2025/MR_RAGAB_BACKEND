@@ -60,6 +60,22 @@ function splitIntoSentences(text, maxLength = 250) {
   return chunks.filter(Boolean);
 }
 
+function hasRepeatedOutput(text) {
+  const tokens = text.toLocaleLowerCase().split(/\s+/u).filter(Boolean);
+  if (tokens.length < 8) return false;
+
+  const seen = new Map();
+  for (let size = 1; size <= 3; size += 1) {
+    for (let start = 0; start <= tokens.length - size; start += 1) {
+      const phrase = tokens.slice(start, start + size).join(' ');
+      const count = (seen.get(phrase) || 0) + 1;
+      seen.set(phrase, count);
+      if (count >= 4) return true;
+    }
+  }
+  return false;
+}
+
 function enqueueTranslation(operation) {
   if (pendingTranslations >= MAX_PENDING_TRANSLATIONS) {
     const error = new Error('خدمة الترجمة مشغولة حاليًا. حاول تاني بعد قليل.');
@@ -81,12 +97,17 @@ async function translate(text, direction) {
     const chunks = splitIntoSentences(text);
     const translatedChunks = [];
     for (const chunk of chunks) {
-      const result = await translator(chunk, { max_new_tokens: 160, num_beams: 4 });
+      const sourceWords = chunk.trim().split(/\s+/u).length;
+      const result = await translator(chunk, {
+        max_new_tokens: Math.min(96, Math.max(12, sourceWords * 8)),
+        num_beams: 4,
+        no_repeat_ngram_size: 3,
+        repetition_penalty: 1.2,
+      });
       const translated = String(result?.[0]?.translation_text || '').trim();
-      // Never return decoder noise (for example, repeated ampersands) as a
-      // successful translation. It is safer to surface an error than display
-      // symbols as Arabic to students.
-      if (translated && !/[\p{L}\p{N}]/u.test(translated)) {
+      // Never return decoder noise (symbols or looping phrases) as a
+      // successful translation. Surface an error instead of displaying it.
+      if (translated && (!/[\p{L}\p{N}]/u.test(translated) || hasRepeatedOutput(translated))) {
         const error = new Error('محرك الترجمة أعاد نتيجة غير صالحة. حاول مرة أخرى بعد قليل.');
         error.status = 502;
         throw error;
