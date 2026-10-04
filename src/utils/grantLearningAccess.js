@@ -4,9 +4,25 @@ const LectureAccess = require('../models/LectureAccess');
 function expiry(days) { const value = new Date(); value.setDate(value.getDate() + Number(days || 10)); return value; }
 
 async function grantCourseEnrollment({ course, studentId, tenantId, source, session = null }) {
+  const now = new Date();
+  const identity = { tenantId, studentId, courseId: course._id };
+  const renewal = {
+    $set: { purchasedAt: now, expiresAt: expiry(course.accessPeriodDays), source }
+  };
+
+  // Renew the existing unique row only after its prior access expired. This
+  // keeps history compact while making the new access window and purchase
+  // source authoritative for the latest purchase.
+  const renewed = await CourseEnrollment.findOneAndUpdate(
+    { ...identity, expiresAt: { $lte: now } },
+    renewal,
+    { new: true, session }
+  );
+  if (renewed) return renewed;
+
   return CourseEnrollment.findOneAndUpdate(
-    { tenantId, studentId, courseId: course._id },
-    { $setOnInsert: { tenantId, studentId, courseId: course._id, purchasedAt: new Date(), expiresAt: expiry(course.accessPeriodDays), source } },
+    identity,
+    { $setOnInsert: { ...identity, purchasedAt: now, expiresAt: expiry(course.accessPeriodDays), source } },
     { upsert: true, new: true, setDefaultsOnInsert: true, session }
   );
 }

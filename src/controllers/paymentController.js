@@ -17,6 +17,13 @@ async function grantCourseAccess({ course, studentId, tenantId, source, session 
   return grantCourseEnrollment({ course, studentId, tenantId, source, session });
 }
 
+async function assertNoActiveCourseEnrollment({ courseId, studentId, tenantId, session = null }) {
+  const existing = await CourseEnrollment.findOne({
+    tenantId, studentId, courseId, expiresAt: { $gt: new Date() }
+  }).session(session);
+  if (existing) throw Object.assign(new Error('أنت مشترك بالفعل في هذه الدورة'), { statusCode: 409 });
+}
+
 async function findLectureForCheckout(req) {
   const lecture = await Lecture.findOne({ _id: req.params.lectureId, courseId: req.params.courseId, ...req.tenantFilter });
   if (!lecture || !lecture.isPublished) { const error = new Error('المحاضرة غير متاحة'); error.statusCode = 404; throw error; }
@@ -104,8 +111,7 @@ exports.checkoutCourseWithWallet = async (req, res, next) => {
     if (Number(course.price) <= 0) return res.status(400).json({ message: 'استخدم الاشتراك المجاني لهذه الدورة' });
     let result;
     await session.withTransaction(async () => {
-      const existing = await CourseEnrollment.findOne({ tenantId: req.user.tenantId, studentId: req.user._id, courseId: course._id }).session(session);
-      if (existing) throw Object.assign(new Error('أنت مشترك بالفعل في هذه الدورة'), { statusCode: 409 });
+      await assertNoActiveCourseEnrollment({ courseId: course._id, studentId: req.user._id, tenantId: req.user.tenantId, session });
       const student = await User.findOneAndUpdate(
         { _id: req.user._id, ...req.tenantFilter, walletBalance: { $gte: Number(course.price) } },
         { $inc: { walletBalance: -Number(course.price) } },
@@ -211,6 +217,7 @@ exports.startCourseCheckout = async (req, res, next) => {
   try {
     const course = await findCourseForCheckout(req);
     if (Number(course.price) <= 0) return res.status(400).json({ message: 'هذه الدورة مجانية' });
+    await assertNoActiveCourseEnrollment({ courseId: course._id, studentId: req.user._id, tenantId: req.user.tenantId });
     return startPaymobCheckout(req, res, next, { course, price: Number(course.price) });
   } catch (err) { return next(err); }
 };
