@@ -12,13 +12,19 @@ function daysRemaining(expiresAt) {
   return Math.max(0, Math.ceil(diffMs / (1000 * 60 * 60 * 24)));
 }
 
+function enrolledCourseViewLimit(enrollment, course) {
+  return Object.prototype.hasOwnProperty.call(enrollment, 'maxViews')
+    ? enrollment.maxViews
+    : (course.maxViews ?? null);
+}
+
 // Shared lecture-scoped entitlement for the detail list and the player gate.
 // Legacy full-course rows use LectureAccess.courseId = courseId; Part C's
 // individual rows use that legacy key = lectureId.
 async function getLectureAccessState({ studentId, tenantFilter, courseId, lectureId }) {
   const now = new Date();
   const [course, lecture] = await Promise.all([
-    Course.findOne({ _id: courseId, isPublished: true, ...tenantFilter }).select('_id').lean(),
+    Course.findOne({ _id: courseId, isPublished: true, ...tenantFilter }).select('_id maxViews').lean(),
     Lecture.findOne({ _id: lectureId, courseId, isPublished: true, ...tenantFilter }).lean()
   ]);
   if (!course || !lecture) return { found: false };
@@ -39,7 +45,8 @@ async function getLectureAccessState({ studentId, tenantFilter, courseId, lectur
   const isPurchased = Boolean(courseEnrollment || courseAccess || lectureAccess);
   const accessible = isFree || isPurchased;
   const status = isFree ? 'free' : isPurchased ? 'purchased' : 'not_purchased';
-  return { found: true, lecture, accessible, status, sequenceUnlocked, isFree, isPurchased, access: lectureAccess || courseAccess || null, includedWithCourse: Boolean(courseEnrollment || courseAccess) };
+  const courseEnrollmentMaxViews = courseEnrollment ? enrolledCourseViewLimit(courseEnrollment, course) : null;
+  return { found: true, lecture, accessible, status, sequenceUnlocked, isFree, isPurchased, access: lectureAccess || courseAccess || null, courseEnrollment, courseEnrollmentMaxViews, includedWithCourse: Boolean(courseEnrollment || courseAccess) };
 }
 
 exports.getLectureAccessState = getLectureAccessState;
@@ -49,14 +56,47 @@ exports.startLectureView = async (req, res, next) => {
     const state = await getLectureAccessState({ studentId: req.user._id, tenantFilter: req.tenantFilter, courseId: req.params.courseId, lectureId: req.params.lectureId });
     if (!state.found) return res.status(404).json({ message: 'المحاضرة غير موجودة' });
     if (!state.accessible) return res.status(403).json({ message: state.status === 'pending_previous' ? 'أكمل المحاضرة السابقة أولاً' : 'لم يتم شراء هذه المحاضرة' });
-    if (state.access && state.access.viewsUsed >= state.access.maxViews) return res.status(403).json({ message: 'لقد استنفدت عدد مرات المشاهدة المسموحة' });
-    if (state.access) { await LectureAccess.updateOne({ _id: state.access._id, studentId: req.user._id, ...req.tenantFilter }, { $inc: { viewsUsed: 1 } }); state.access.viewsUsed += 1; }
+    let viewsRemaining = null;
+    if (state.courseEnrollment) {
+      const courseLimit = state.courseEnrollmentMaxViews;
+      const lectureLimit = state.lecture.maxViews ?? null;
+      const courseUsed = Number(state.courseEnrollment.viewsUsed || 0);
+      const lectureViewPath = `viewsByLecture.${String(state.lecture._id)}`;
+      const lectureUsed = Number(state.courseEnrollment.viewsByLecture?.[String(state.lecture._id)] || 0);
+      if ((courseLimit != null && courseUsed >= courseLimit) || (lectureLimit != null && lectureUsed >= lectureLimit)) {
+        return res.status(403).json({ message: 'لقد استنفدت عدد مرات المشاهدة المسموحة' });
+      }
+      const conditions = [];
+      if (courseLimit != null) conditions.push({ $or: [{ viewsUsed: { $lt: courseLimit } }, { viewsUsed: { $exists: false } }] });
+      if (lectureLimit != null) conditions.push({ $or: [{ [lectureViewPath]: { $lt: lectureLimit } }, { [lectureViewPath]: { $exists: false } }] });
+      const viewFilter = { _id: state.courseEnrollment._id, ...req.tenantFilter };
+      if (conditions.length) viewFilter.$and = conditions;
+      const increments = { [lectureViewPath]: 1 };
+      if (courseLimit != null) increments.viewsUsed = 1;
+      const enrollment = await CourseEnrollment.findOneAndUpdate(
+        viewFilter,
+        { $inc: increments, $set: { maxViews: courseLimit } },
+        { new: true }
+      ).lean();
+      if (!enrollment) return res.status(403).json({ message: 'لقد استنفدت عدد مرات المشاهدة المسموحة' });
+      const remainingLimits = [
+        courseLimit == null ? null : Math.max(0, courseLimit - Number(enrollment.viewsUsed || 0)),
+        lectureLimit == null ? null : Math.max(0, lectureLimit - Number(enrollment.viewsByLecture?.[String(state.lecture._id)] || 0))
+      ].filter((value) => value != null);
+      viewsRemaining = remainingLimits.length ? Math.min(...remainingLimits) : null;
+    } else if (state.access) {
+      if (state.access.viewsUsed >= state.access.maxViews) return res.status(403).json({ message: 'لقد استنفدت عدد مرات المشاهدة المسموحة' });
+      await LectureAccess.updateOne({ _id: state.access._id, studentId: req.user._id, ...req.tenantFilter }, { $inc: { viewsUsed: 1 } });
+      state.access.viewsUsed += 1;
+      viewsRemaining = Math.max(0, state.access.maxViews - state.access.viewsUsed);
+    }
     let videoUrl = null;
     if (state.lecture.videoUrl?.startsWith('/uploads/videos/')) {
       const mediaToken = jwt.sign({ sub: String(req.user._id), tenantId: String(req.user.tenantId), courseId: String(req.params.courseId), lectureId: String(req.params.lectureId), media: true }, process.env.JWT_SECRET, { expiresIn: '5m' });
       videoUrl = `${req.protocol}://${req.get('host')}/api/v1/courses/${req.params.courseId}/lectures/${req.params.lectureId}/video?token=${encodeURIComponent(mediaToken)}`;
     }
-    res.json({ data: { lecture: { ...state.lecture, videoUrl: null }, videoUrl, viewsRemaining: state.access ? Math.max(0, state.access.maxViews - state.access.viewsUsed) : null, daysRemaining: state.access ? daysRemaining(state.access.expiresAt) : null, watermark: { name: req.user.name, phone: req.user.phone || '' } } });
+    const expiresAt = state.courseEnrollment?.expiresAt || state.access?.expiresAt;
+    res.json({ data: { lecture: { ...state.lecture, videoUrl: null }, videoUrl, viewsRemaining, daysRemaining: expiresAt ? daysRemaining(expiresAt) : null, watermark: { name: req.user.name, phone: req.user.phone || '' } } });
   } catch (err) { next(err); }
 };
 
@@ -110,7 +150,7 @@ exports.streamLectureVideo = async (req, res, next) => {
 // rows both establish ownership.
 async function getEnrolledCoursesForStudent({ studentId, tenantFilter }) {
     const now = new Date();
-    const courseSelection = 'title_ar title_en description_ar description_en thumbnailUrl stage price';
+    const courseSelection = 'title_ar title_en description_ar description_en thumbnailUrl stage price maxViews accessPeriodDays';
     const [accessRecords, enrollmentRecords] = await Promise.all([
       LectureAccess.find({ studentId, ...tenantFilter, expiresAt: { $gt: now } })
         .lean()
@@ -159,9 +199,10 @@ async function getEnrolledCoursesForStudent({ studentId, tenantFilter }) {
       coursesById.set(String(enrollment.courseId._id), {
         accessId: enrollment._id,
         course: enrollment.courseId,
+        _enrollment: enrollment,
         purchasedAt: enrollment.purchasedAt,
         expiresAt: enrollment.expiresAt,
-        viewsRemaining: null,
+        viewsRemaining: enrolledCourseViewLimit(enrollment, enrollment.courseId) == null ? null : Math.max(0, enrolledCourseViewLimit(enrollment, enrollment.courseId) - Number(enrollment.viewsUsed || 0)),
         includedWithCourse: true,
         fullAccess: true
       });
@@ -171,20 +212,44 @@ async function getEnrolledCoursesForStudent({ studentId, tenantFilter }) {
     for (const course of partialCourses) {
       if (coursesById.has(String(course._id))) continue;
       const ownedLectureIds = lecturesByCourse.get(String(course._id)) || [];
-      const firstAccess = accessRecords.find((access) => ownedLectureIds.includes(String(access.courseId)));
+      const courseAccesses = accessRecords.filter((access) => ownedLectureIds.includes(String(access.courseId)));
+      const earliestExpiry = courseAccesses.reduce((earliest, access) => (
+        !earliest || new Date(access.expiresAt) < new Date(earliest) ? access.expiresAt : earliest
+      ), null);
       coursesById.set(String(course._id), {
         course,
-        purchasedAt: firstAccess?.purchasedAt || now,
-        expiresAt: firstAccess?.expiresAt || now,
-        viewsRemaining: null,
+        purchasedAt: courseAccesses.reduce((latest, access) => (
+          !latest || new Date(access.purchasedAt) > new Date(latest) ? access.purchasedAt : latest
+        ), null) || now,
+        expiresAt: earliestExpiry,
+        viewsRemaining: courseAccesses.reduce((total, access) => total + Math.max(0, access.maxViews - access.viewsUsed), 0),
         partialLectureCount: ownedLectureIds.length,
         fullAccess: false
       });
     }
     const courseIds = [...coursesById.keys()];
-    const lectureCounts = courseIds.length ? await Lecture.aggregate([{ $match: { courseId: { $in: courseIds.map((id) => new (require('mongoose').Types.ObjectId)(id)) }, isPublished: true, ...tenantFilter } }, { $group: { _id: '$courseId', count: { $sum: 1 } } }]) : [];
+    const lectureCounts = courseIds.length ? await Lecture.aggregate([
+      { $match: { courseId: { $in: courseIds.map((id) => new (require('mongoose').Types.ObjectId)(id)) }, isPublished: true, ...tenantFilter } },
+      { $group: { _id: '$courseId', count: { $sum: 1 }, lectures: { $push: { id: '$_id', maxViews: '$maxViews' } } } }
+    ]) : [];
     const countByCourse = new Map(lectureCounts.map((row) => [String(row._id), row.count]));
-    for (const [courseId, value] of coursesById) value.course = { ...(value.course.toObject ? value.course.toObject() : value.course), lectureCount: countByCourse.get(courseId) || 0 };
+    const lecturesByCourseId = new Map(lectureCounts.map((row) => [String(row._id), row.lectures]));
+    for (const [courseId, value] of coursesById) {
+      value.course = { ...(value.course.toObject ? value.course.toObject() : value.course), lectureCount: countByCourse.get(courseId) || 0 };
+      if (!value.includedWithCourse) continue;
+      const lectures = lecturesByCourseId.get(courseId) || [];
+      const viewsByLecture = value._enrollment?.viewsByLecture || {};
+      const lectureRemaining = lectures.reduce((total, lecture) => (
+        lecture.maxViews == null ? null : total == null ? null : total + Math.max(0, lecture.maxViews - Number(viewsByLecture[String(lecture.id)] || 0))
+      ), 0);
+      const enrollmentLimit = value._enrollment ? enrolledCourseViewLimit(value._enrollment, value.course) : value.course.maxViews ?? null;
+      const courseRemaining = enrollmentLimit == null
+        ? null
+        : Math.max(0, enrollmentLimit - Number(value._enrollment?.viewsUsed || 0));
+      const available = [courseRemaining, lectureRemaining].filter((remaining) => remaining != null);
+      value.viewsRemaining = available.length ? Math.min(...available) : null;
+    }
+    for (const value of coursesById.values()) delete value._enrollment;
     const courses = [...coursesById.values()]
       .sort((left, right) => new Date(right.purchasedAt) - new Date(left.purchasedAt));
     return courses;

@@ -7,6 +7,10 @@ const courseEnrollmentSchema = new mongoose.Schema({
   courseId: { type: mongoose.Schema.Types.ObjectId, ref: 'Course', required: true },
   purchasedAt: { type: Date, default: Date.now },
   expiresAt: { type: Date, required: true },
+  // Snapshot course rules at purchase; null maxViews is explicitly unlimited.
+  maxViews: { type: Number, default: null },
+  viewsUsed: { type: Number, default: 0 },
+  viewsByLecture: { type: Map, of: Number, default: () => new Map() },
   source: { type: String, enum: ['paymob', 'wallet', 'access_code', 'free'], required: true }
 }, { timestamps: true });
 

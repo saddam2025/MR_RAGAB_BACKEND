@@ -7,7 +7,7 @@ async function grantCourseEnrollment({ course, studentId, tenantId, source, sess
   const now = new Date();
   const identity = { tenantId, studentId, courseId: course._id };
   const renewal = {
-    $set: { purchasedAt: now, expiresAt: expiry(course.accessPeriodDays), source }
+    $set: { purchasedAt: now, expiresAt: expiry(course.accessPeriodDays), maxViews: course.maxViews ?? null, viewsUsed: 0, viewsByLecture: {}, source }
   };
 
   // Renew the existing unique row only after its prior access expired. This
@@ -22,7 +22,7 @@ async function grantCourseEnrollment({ course, studentId, tenantId, source, sess
 
   return CourseEnrollment.findOneAndUpdate(
     identity,
-    { $setOnInsert: { ...identity, purchasedAt: now, expiresAt: expiry(course.accessPeriodDays), source } },
+    { $setOnInsert: { ...identity, purchasedAt: now, expiresAt: expiry(course.accessPeriodDays), maxViews: course.maxViews ?? null, viewsUsed: 0, viewsByLecture: {}, source } },
     { upsert: true, new: true, setDefaultsOnInsert: true, session }
   );
 }
