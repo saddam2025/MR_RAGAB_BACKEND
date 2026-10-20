@@ -27,4 +27,6 @@ const courseSchema = new mongoose.Schema(
   { timestamps: true }
 );
 
+courseSchema.index({ tenantId: 1, isPublished: 1, createdAt: 1 });
+
 module.exports = mongoose.model('Course', courseSchema);

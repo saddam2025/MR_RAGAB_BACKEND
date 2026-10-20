@@ -31,5 +31,6 @@ const videoProgressSchema = new mongoose.Schema(
 // Do not make courseId unique: a student has one progress record per lecture.
 videoProgressSchema.index({ tenantId: 1, studentId: 1, courseId: 1 });
 videoProgressSchema.index({ tenantId: 1, studentId: 1, lectureId: 1 }, { unique: true, partialFilterExpression: { lectureId: { $type: 'objectId' } } });
+videoProgressSchema.index({ tenantId: 1, studentId: 1, lastWatchedAt: 1 });
 
 module.exports = mongoose.model('VideoProgress', videoProgressSchema);

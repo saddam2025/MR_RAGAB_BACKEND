@@ -141,18 +141,72 @@ async function listInstructorAssignments(req, res, next, pendingOnly) {
       return res.status(403).json({ message: 'غير مصرح لك بعرض قائمة واجبات هذا الحساب' });
     }
 
-    const filter = { ...getTenantFilter(req) };
+    const courses = await Course.find({ instructorId, ...getTenantFilter(req) }).select('_id').lean();
+    const courseIds = courses.map((course) => course._id);
+    const filter = { ...getTenantFilter(req), courseId: { $in: courseIds } };
     if (pendingOnly) filter.status = 'pending';
-    const assignments = await Assignment.find(filter)
+    const assignmentQuery = Assignment.find(filter)
       .populate({ path: 'courseId', match: { instructorId, ...getTenantFilter(req) }, select: 'title_ar title_en instructorId' })
+      .populate({ path: 'lectureId', select: 'title_ar title_en' })
       .populate({ path: 'studentId', select: 'name email' })
       .sort({ submittedAt: 1 });
+    const assignments = await assignmentQuery;
 
     // A tenant can theoretically contain several instructors, so population
     // matching is not enough: remove assignments whose course is another
     // instructor's before returning the queue.
     const data = assignments.filter((assignment) => assignment.courseId);
-    res.json({ data });
+    if (pendingOnly) return res.json({ data });
+
+    const now = new Date();
+    const cairoParts = (date) => Object.fromEntries(
+      new Intl.DateTimeFormat('en-CA', {
+        timeZone: 'Africa/Cairo', year: 'numeric', month: '2-digit', day: '2-digit'
+      }).formatToParts(date).filter((part) => part.type !== 'literal').map((part) => [part.type, Number(part.value)])
+    );
+    const dateKey = ({ year, month, day }) => `${year}-${String(month).padStart(2, '0')}-${String(day).padStart(2, '0')}`;
+    const shiftDate = (parts, amount) => {
+      const shifted = new Date(Date.UTC(parts.year, parts.month - 1, parts.day + amount));
+      return { year: shifted.getUTCFullYear(), month: shifted.getUTCMonth() + 1, day: shifted.getUTCDate() };
+    };
+    const cairoMidnightUtc = (parts) => {
+      const target = Date.UTC(parts.year, parts.month - 1, parts.day);
+      let candidate = target;
+      for (let attempt = 0; attempt < 3; attempt += 1) {
+        const local = new Intl.DateTimeFormat('en-GB', {
+          timeZone: 'Africa/Cairo', year: 'numeric', month: '2-digit', day: '2-digit',
+          hour: '2-digit', minute: '2-digit', second: '2-digit', hourCycle: 'h23'
+        }).formatToParts(new Date(candidate));
+        const values = Object.fromEntries(local.filter((part) => part.type !== 'literal').map((part) => [part.type, Number(part.value)]));
+        candidate += target - Date.UTC(values.year, values.month - 1, values.day, values.hour, values.minute, values.second);
+      }
+      return new Date(candidate);
+    };
+    const today = cairoParts(now);
+    const firstDay = shiftDate(today, -6);
+    const start = cairoMidnightUtc(firstDay);
+    const end = cairoMidnightUtc(shiftDate(today, 1));
+    const [statusGroups, dailyGroups] = await Promise.all([
+      Assignment.aggregate([
+        { $match: { ...filter } },
+        { $group: { _id: '$status', count: { $sum: 1 } } }
+      ]),
+      Assignment.aggregate([
+        { $match: { ...filter, status: { $in: ['graded', 'resubmit'] }, gradedAt: { $gte: start, $lt: end } } },
+        { $group: {
+          _id: { $dateToString: { date: '$gradedAt', format: '%Y-%m-%d', timezone: 'Africa/Cairo' } },
+          count: { $sum: 1 }
+        } }
+      ])
+    ]);
+    const counts = { pending: 0, graded: 0, resubmit: 0 };
+    statusGroups.forEach(({ _id, count }) => { if (Object.hasOwn(counts, _id)) counts[_id] = count; });
+    const dailyCountByDate = new Map(dailyGroups.map(({ _id, count }) => [_id, count]));
+    const correctedByDay = Array.from({ length: 7 }, (_, index) => {
+      const date = dateKey(shiftDate(firstDay, index));
+      return { date, count: dailyCountByDate.get(date) || 0 };
+    });
+    res.json({ data, summary: { counts, correctedByDay } });
   } catch (err) {
     next(err);
   }

@@ -20,5 +20,7 @@ const assignmentSchema = new mongoose.Schema(
 // A student can submit one assignment for each lecture. The lecture-level
 // index also prevents duplicate concurrent submissions for that same lecture.
 assignmentSchema.index({ tenantId: 1, studentId: 1, lectureId: 1 }, { unique: true, partialFilterExpression: { lectureId: { $type: 'objectId' } } });
+assignmentSchema.index({ tenantId: 1, status: 1, submittedAt: 1 });
+assignmentSchema.index({ tenantId: 1, courseId: 1, status: 1, gradedAt: 1 });
 
 module.exports = mongoose.model('Assignment', assignmentSchema);

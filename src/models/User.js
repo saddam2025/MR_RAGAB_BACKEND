@@ -164,6 +164,8 @@ userSchema.set('toJSON', {
   }
 });
 
+userSchema.index({ tenantId: 1, role: 1, createdAt: 1 });
+
 const User = mongoose.model('User', userSchema);
 module.exports = User;
 module.exports.PERMISSION_ENUM = PERMISSION_ENUM;
